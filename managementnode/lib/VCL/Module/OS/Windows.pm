@@ -3892,7 +3892,7 @@ sub reboot {
 				return 0;
 			}
 			
-			# Set sshd service startup mode to auto
+			# Set sshd service startup mode to manual as cygwin reset is expected
 			if (!$self->set_service_startup_mode('sshd', 'manual')) {
 				notify($ERRORS{'WARNING'}, 0, "reboot not attempted, unable to set sshd service startup mode to manual");
 				return 0;
@@ -13790,6 +13790,7 @@ sub ad_join_ps {
 	my $start_time = time;
 	my $rename_computer_reboot_duration = 0;
 	my $ad_join_reboot_duration = 0;
+	my $dns_regex = "([a-z0-9]+(-[a-z0-9]+)*\.)+[a-z]{2,}";
 	
 	my $computer_name	= $self->data->get_computer_short_name();
 	my $image_name	= $self->data->get_image_name();
@@ -13856,7 +13857,7 @@ sub ad_join_ps {
 			}
 			
 			my $rename_computer_reboot_start = time;
-			if (!$self->reboot(300, 3, 1)) {
+			if (!$self->reboot(300, 3, 1, 1)) {
 				notify($ERRORS{'WARNING'}, 0, "failed to join $computer_name to Active Directory domain, failed to reboot computer after it was renamed");
 				return;
 			}
@@ -13868,7 +13869,7 @@ sub ad_join_ps {
 	# If object exists in different OU, the following error will occur when attempting to join the domain:
 	#    This command cannot be executed on target computer('<name>') due to following error: The account already exists.
 	# Don't bother moving existing objects
-	$self->ad_delete_computer();
+	my $preferred_domain_controller = $self->ad_delete_computer();
 	
 	# Assemble the PowerShell script
 	my $ad_powershell_script = <<EOF;
@@ -13876,10 +13877,18 @@ sub ad_join_ps {
 Clear-Host
 \$username = '$domain_user_string'
 \$password = '$domain_password_escaped'
+\$preferred_domain_controller = '$preferred_domain_controller'
+\$dns_regex = '$dns_regex'
 Write-Host "username (between >*<): `n>\$username<`n"
 Write-Host "password (between >*<): `n>\$password<`n"
 \$ps_credential = New-Object System.Management.Automation.PsCredential(\$username, (ConvertTo-SecureString \$password -AsPlainText -Force))
-Add-Computer -DomainName '$domain_dns_name' -Credential \$ps_credential $domain_computer_command_section -Verbose -ErrorAction Stop
+if (\$preferred_domain_controller -match \$dns_regex) {
+    Write-Host "joining computer to domain $domain_dns_name using domain controller $preferred_domain_controller"
+    Add-Computer -DomainName '$domain_dns_name' -Credential \$ps_credential $domain_computer_command_section -Server '$preferred_domain_controller' -Verbose -ErrorAction Stop
+}
+else {
+	Add-Computer -DomainName '$domain_dns_name' -Credential \$ps_credential $domain_computer_command_section -Verbose -ErrorAction Stop
+}
 EOF
 	
 	notify($ERRORS{'DEBUG'}, 0, "attempting to join $computer_name to $domain_dns_name domain using PowerShell script:\n$ad_powershell_script");
@@ -14428,6 +14437,13 @@ sub ad_search {
 		return;
 	}
 	
+	# Get computer public IP address for active directory site calculation
+	my $current_public_ip_address = $self->get_public_ip_address();
+	my $current_public_subnet_mask = $self->get_public_subnet_mask();
+	notify($ERRORS{'DEBUG'}, 0, "trying to convert the computers public ip: $current_public_ip_address and subnet mask: $current_public_subnet_mask to cidr format");
+	my $vm_subnet = $self->convert_dotted_decimal_to_cidr($current_public_ip_address, $current_public_subnet_mask);
+	notify($ERRORS{'DEBUG'}, 0, "cidr formatted public network: $vm_subnet");
+
 	my $attempt_limit = $arguments->{attempt_limit} || 3;
 	
 	# This sub handles both search and delete under very strict conditions
@@ -14469,14 +14485,62 @@ Clear-Host
 \$domain_password = '$domain_password_escaped'
 \$ldap_filter = '$ldap_filter'
 \$delete = '$delete'
+\$vm_subnet = '$vm_subnet'
+\$vm_site = \$null
+\$subnet_found = \$false
+\$first_dc_within_site = ''
+\$entry_found = \$false
+\$entry_deleted = \$false
 
 Write-Host "domain: $domain_dns_name"
 Write-Host "domain username (between >*<): >\$domain_username<"
 Write-Host "domain password (between >*<): >\$domain_password<"
+Write-Host "vm_subnet: $vm_subnet"
 
 EOF
 
 	$powershell_script_contents .= <<'EOF';
+if ($vm_subnet -ne '') {
+	$type = [System.DirectoryServices.ActiveDirectory.DirectoryContextType]"Forest"
+	$directory_context = New-Object System.DirectoryServices.ActiveDirectory.DirectoryContext($type, $domain_dns_name, $domain_username, $domain_password)
+
+	try {
+		$forest = [System.DirectoryServices.ActiveDirectory.Forest]::GetForest($directory_context)
+	}
+	catch {
+		if ($_.Exception.InnerException) {
+			$exception_message = $_.Exception.InnerException.Message
+		}
+		else {
+			$exception_message = $_.Exception.Message
+		}
+		Write-Host "ERROR: failed to connect to $domain_dns_name forest, username: $domain_username, password: $domain_password, error: $exception_message"
+		exit
+	}
+
+	foreach ($site in $forest.Sites) {
+		foreach ($subnet in $site.Subnets) {
+			if ($subnet -match $vm_subnet) {
+				$subnet_found = $true
+				$vm_site = $site
+			}
+			if ($subnet_found) { break }
+		}
+		if ($subnet_found) { break }
+	}
+}
+else {
+	Write-Host "VM subnet is not defined. Cannot calculate site information"
+}
+
+if ($vm_site -eq $null) {
+    Write-Host "VM active directory site information could not be retrieved. Setting vm_site to Default-First-Site-Name"
+	$vm_site = 'Default-First-Site-Name'
+}
+else {
+	Write-host "VM belongs to site: $vm_site"
+}
+
 $type = [System.DirectoryServices.ActiveDirectory.DirectoryContextType]"Domain"
 $directory_context = New-Object System.DirectoryServices.ActiveDirectory.DirectoryContext($type, $domain_dns_name, $domain_username, $domain_password)
 try {
@@ -14493,53 +14557,89 @@ catch {
    exit
 }
 
-$searcher = New-Object System.DirectoryServices.DirectorySearcher($domain.GetDirectoryEntry())
-$searcher.filter = "$ldap_filter"
-try {
-   $results = $searcher.FindAll()
-   # Try to output the results to catch this exception:
-   # An error occurred while enumerating through a collection: The <...> search filter is invalid.
-   $results | Out-Null
-}
-catch {
-   Write-Host "ERROR: failed to search for entries matching LDAP filter: --> '$ldap_filter', error: $($_.Exception.Message)"
-   exit 1
+$domain_controllers = $domain.DomainControllers
+$dc_count = 0
+foreach ($dc in $domain_controllers) {
+    $site = $dc.SiteName
+    $dc_name = $dc.Name
+    if ($site -eq $vm_site) {
+		if ($dc_count -eq 0) {
+			$first_dc_within_site = $dc_name
+		}
+		$dc_count+=1
+        # Find Entry
+        Write-Host "searching entries matching LDAP filter: '$ldap_filter' on domain controller: '$dc_name'"
+        $searcher = $dc.GetDirectorySearcher()
+        $searcher.filter = "$ldap_filter"
+        try {
+           $results = $searcher.FindAll()
+           # Try to output the results to catch this exception:
+           # An error occurred while enumerating through a collection: The <...> search filter is invalid.
+           $results | Out-Null
+        }
+        catch {
+           Write-Host "ERROR: failed to search for entries matching LDAP filter: --> '$ldap_filter', error: $($_.Exception.Message)"
+        }
+
+        Write-Host "delete true : $delete"
+        if ($results.Count -eq 0) {
+            Write-Host "no entries found to delete matching LDAP filter: '$ldap_filter'"
+        }
+        elseif ($results.Count -gt 1) {
+            Write-Host "ERROR: delete not performed for safety, multiple entries found to delete matching LDAP filter: '$ldap_filter'`n$($results | Select -ExpandProperty Path | Out-String)"
+            exit 1
+        }
+
+        # Get entry and delete if needed
+        ForEach($result in $results) {
+           $entry = $result.GetDirectoryEntry();
+           $dn = $entry.distinguishedName
+           if ($dn) {
+				$entry_found = $true
+				Write-Host "entry found. preferred domain controller: '$dc_name'"
+		   }
+           if ($delete -eq 1) {
+              Write-Host "attempting to delete entry: $dn"
+              try {
+                 $entry.DeleteTree();
+                 Write-Host "deleted entry: $dn from domain controller: '$dc_name'. sleeping for 20 seconds to complete intrasite replication"
+                 Start-Sleep -Seconds 20
+                 Write-Host "sleep completed. preferred domain controller: '$dc_name'"
+                 $entry_deleted = $true
+              }
+              catch {
+                 Write-Host "ERROR: failed to delete entry: $dn, error: $($_.Exception.Message)"
+              }
+           }
+           else {
+              Write-Host $dn
+           }
+        }
+    }
+    else {
+        Write-Host "ignoring domain controller '$dc_name' as it does not belong to '$vm_site' site. it belongs to '$site' site"
+    }
+
+    if (($delete -eq 1) -and $entry_deleted) { break }
+    else { if ($entry_found) { break } }
 }
 
-
-if ($delete -eq 1) {
-Write-Host "delete true : $delete"
-   if ($results.Count -eq 0) {
-      Write-Host "no entries found to delete matching LDAP filter: '$ldap_filter'"
-      exit 0
-   }
-   elseif ($results.Count -gt 1) {
-      Write-Host "ERROR: delete not performed for safety, multiple entries found to delete matching LDAP filter: '$ldap_filter'`n$($results | Select -ExpandProperty Path | Out-String)"
-      exit 1
-   }
+if ($dc_count -gt 1) {
+	Write-Host "there are total '$dc_count' domain controllers within the site '$vm_site'"
+	Write-Host "first domain controller: '$first_dc_within_site'"
 }
 
-ForEach($result in $results) {
-   $entry = $result.GetDirectoryEntry();
-   $dn = $entry.distinguishedName
-   if ($delete -eq 1) {
-      Write-Host "attempting to delete entry: $dn"
-      try {
-         $entry.DeleteTree();
-         Write-Host "deleted entry: $dn"
-      }
-      catch {
-         Write-Host "ERROR: failed to delete entry: $dn, error: $($_.Exception.Message)"
-         exit 1
-      }
-   }
-   else {
-      Write-Host $dn
-   }
+if ($delete -eq 1 -and $entry_found) {
+    if (! $entry_deleted) {
+        Write-Host "ERROR: failed to delete entry: $dn"
+        exit 1
+    }
 }
 EOF
 
 	my ($exit_status, $output);
+	my $preferred_domain_controller = '';
+	my $first_domain_controller = '';
 	for (my $attempt=1; $attempt<=$attempt_limit; $attempt++) {
 		($exit_status, $output) = $self->run_powershell_as_script($powershell_script_contents, 0, 0);
 		if (!defined($output)) {
@@ -14553,6 +14653,19 @@ EOF
 			notify($notify_type, 0, "attempt $attempt/$attempt_limit: failed to $operation objects on $computer_name in $domain_dns_name AD domain matching LDAP filter: '$ldap_filter', error occurred:\n" . join("\n", @$output));
 		}
 		else {
+			# set preferred domain controller
+			if (defined($output)) {
+				for my $line (@$output) {
+					if ( $line =~  /^[\w\s]+\.\spreferred\sdomain\scontroller\:\s\'(([a-z0-9]+(-[a-z0-9]+)*\.)+[a-z]{2,})\'/i ) {
+						($preferred_domain_controller) = $line =~  /^[\w\s]+\.\spreferred\sdomain\scontroller\:\s\'(([a-z0-9]+(-[a-z0-9]+)*\.)+[a-z]{2,})\'/i;
+						notify($ERRORS{'DEBUG'}, 0, "setting preferred domain controller to: $preferred_domain_controller");
+					}
+					elsif ( $line =~  /^first\sdomain\scontroller\:\s\'(([a-z0-9]+(-[a-z0-9]+)*\.)+[a-z]{2,})\'/i ) {
+						($first_domain_controller) = $line =~  /^first\sdomain\scontroller\:\s\'(([a-z0-9]+(-[a-z0-9]+)*\.)+[a-z]{2,})\'/i;
+						notify($ERRORS{'DEBUG'}, 0, "setting first domain controller to: $first_domain_controller");
+					}
+				}
+			}
 			last;
 		}
 		return if $attempt == $attempt_limit;
@@ -14560,7 +14673,18 @@ EOF
 	
 	if ($operation eq 'delete') {
 		notify($ERRORS{'OK'}, 0, "deleted objects on $computer_name in $domain_dns_name AD domain matching LDAP filter: '$ldap_filter', output:\n" . join("\n", @$output));
-		return 1;
+		if ($preferred_domain_controller ne '') {
+			notify($ERRORS{'OK'}, 0, "returning domain controller: $preferred_domain_controller");
+			return $preferred_domain_controller;
+		}
+		elsif ($first_domain_controller ne '') {
+			notify($ERRORS{'OK'}, 0, "returning domain controller: $first_domain_controller");
+			return $first_domain_controller;
+		}
+		else {
+			notify($ERRORS{'WARNING'}, 0, "not returning any domain controller");
+			return '';
+		}
 	}
 	
 	my @matching_dns;
